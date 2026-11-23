@@ -5,7 +5,9 @@
 - 每个请求先 HEAD 源站拿强 ETag 与总长度，弱 ETag 直接报错；
 - 仅补齐当前 ETag 版本缺失的字节，同版本并发缺口重叠部分只回源一次；
 - 所需字节齐全且来自同一版本才回 206 + Content-Range；
-- 回源时发现换片（ETag 不一致）或回包截断则报错，缺口可重试。
+- 回源时发现换片（ETag 不一致）或回包截断则报错，缺口可重试；
+- 可选的回源额度（ORIGIN_BUDGET_BYTES）：只在本进程本次运行内有效，
+  按“预留 -> 结算”记账，只计从源站读到的 206 正文字节；额度不足回 429。
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ from fastapi.responses import JSONResponse, Response
 
 from .cache import CacheStore, UpstreamError, VersionChanged
 from .intervals import missing
+from .quota import FetchQuota, QuotaExceeded, Reservation
 
 logger = logging.getLogger("proxy")
 
@@ -30,11 +33,26 @@ CACHE_MAX_VERSIONS = int(os.environ.get("CACHE_MAX_VERSIONS", "3"))
 FETCH_MAX_RETRIES = int(os.environ.get("FETCH_MAX_RETRIES", "3"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "10"))
 
+
+def _budget_from_env() -> Optional[int]:
+    """ORIGIN_BUDGET_BYTES：未设置或为空表示不限量；0 表示本次运行不允许回源。"""
+    raw = os.environ.get("ORIGIN_BUDGET_BYTES", "").strip()
+    if raw == "":
+        return None
+    budget = int(raw)
+    if budget < 0:
+        raise ValueError("ORIGIN_BUDGET_BYTES 不能为负数")
+    return budget
+
+
+ORIGIN_BUDGET_BYTES = _budget_from_env()
+
 _RANGE_RE = re.compile(r"^bytes=(\d+)-(\d+)$")
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 
-app = FastAPI(title="video-range-cache-proxy", version="1.0.0")
-store = CacheStore(CACHE_DIR, max_versions=CACHE_MAX_VERSIONS)
+app = FastAPI(title="video-range-cache-proxy", version="1.1.0")
+quota = FetchQuota(ORIGIN_BUDGET_BYTES)
+store = CacheStore(CACHE_DIR, max_versions=CACHE_MAX_VERSIONS, quota=quota)
 client: Optional[httpx.AsyncClient] = None
 
 _stats = {
@@ -45,6 +63,8 @@ _stats = {
     "bytes_fetched": 0,
     "bytes_served": 0,
     "errors": 0,
+    "quota_rejected": 0,
+    "quota_shortfall_bytes": 0,
 }
 
 
@@ -114,11 +134,18 @@ async def head_origin() -> Tuple[str, int]:
 def make_fetcher(total: int):
     """构造绑定当前版本总长度的回源函数。"""
 
-    async def fetch_gap(etag: str, start: int, end: int) -> bytes:
-        """回源取一个闭区间缺口，逐字段校验版本与长度，任何不符即抛错。"""
+    async def fetch_gap(
+        etag: str, start: int, end: int, reservation: Reservation
+    ) -> bytes:
+        """回源取一个闭区间缺口，逐字段校验版本与长度，任何不符即抛错。
+
+        无论成功还是失败，退出前都会用“实际从源站读到的 206 正文字节”结算
+        reservation：截断时读到多少就扣多少，未用部分归还。
+        """
         assert client is not None
         _stats["origin_get"] += 1
         url = f"{ORIGIN_BASE}{VIDEO_PATH}"
+        chunks = []
         try:
             async with client.stream(
                 "GET", url, headers={"Range": f"bytes={start}-{end}"}
@@ -150,7 +177,10 @@ def make_fetcher(total: int):
                     raise VersionChanged(
                         f"源站总长度变化：期望 {total}，实际 {r_total}（疑似换片）"
                     )
-                data = await resp.aread()
+                # 流式累计正文：即使回包被截断/连接中断，已读到的字节也要如实计入额度
+                async for chunk in resp.aiter_bytes():
+                    if chunk:
+                        chunks.append(chunk)
         except VersionChanged:
             raise
         except UpstreamError:
@@ -158,7 +188,12 @@ def make_fetcher(total: int):
         except httpx.HTTPError as exc:
             # 连接中断、响应未读完等都视为回包/网络失败，交由上层重试
             raise UpstreamError(f"回源请求失败: {exc!r}") from exc
+        finally:
+            # 已用只计“代理从本地源站读到的 206 正文字节”；
+            # 非 206 响应没有可用的正文额度消耗，按已累计的 0 结算
+            await quota.settle(reservation, sum(len(chunk) for chunk in chunks))
 
+        data = b"".join(chunks)
         expected = end - start + 1
         if len(data) != expected:
             raise UpstreamError(f"源站回包截断：期望 {expected} 字节，实收 {len(data)}")
@@ -192,6 +227,14 @@ async def video(request: Request) -> Response:
             _stats["cache_hit"] += 1
         await entry.ensure(start, end, make_fetcher(total), FETCH_MAX_RETRIES)
         data = entry.read(start, end)
+    except QuotaExceeded as exc:
+        # 额度不足：ensure 在预留阶段就失败，本次请求一个回源 GET 都没发出
+        _stats["quota_rejected"] += 1
+        _stats["quota_shortfall_bytes"] += max(0, exc.needed - exc.available)
+        logger.warning("origin budget exhausted: %s", exc)
+        response = _error(429, "origin_budget_exhausted", str(exc))
+        response.headers["Retry-After"] = "1"
+        return response
     except VersionChanged as exc:
         logger.warning("version changed: %s", exc)
         return _error(409, "version_changed", str(exc))
@@ -219,7 +262,10 @@ async def video(request: Request) -> Response:
 
 @app.get("/stats")
 async def stats() -> JSONResponse:
-    return JSONResponse(_stats)
+    payload = dict(_stats)
+    # 额度只在本次进程运行内生效，重启即清零
+    payload["origin_budget"] = await quota.snapshot()
+    return JSONResponse(payload)
 
 
 @app.get("/healthz")

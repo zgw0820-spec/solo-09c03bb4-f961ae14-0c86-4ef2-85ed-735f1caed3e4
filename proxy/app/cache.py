@@ -17,12 +17,14 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from .intervals import merge, missing, subtract_gap
+from .quota import FetchQuota, QuotaExceeded, Reservation
 
 logger = logging.getLogger(__name__)
 
 Range = Tuple[int, int]
-# 回源函数：(etag, start, end) -> 该闭区间的完整字节；失败抛异常
-Fetcher = Callable[[str, int, int], Awaitable[bytes]]
+# 回源函数：(etag, start, end, reservation) -> 该闭区间的完整字节；失败抛异常。
+# 实现必须在每次尝试结束（成功或失败）后自行结算 reservation。
+Fetcher = Callable[[str, int, int, Reservation], Awaitable[bytes]]
 
 _SAFE_ETAG = re.compile(r"[^A-Za-z0-9_.-]")
 
@@ -34,10 +36,17 @@ def _safe_name(etag: str) -> str:
 class VersionCache:
     """单个 ETag 版本的缓存。"""
 
-    def __init__(self, etag: str, total_length: int, path: str) -> None:
+    def __init__(
+        self,
+        etag: str,
+        total_length: int,
+        path: str,
+        quota: Optional[FetchQuota] = None,
+    ) -> None:
         self.etag = etag
         self.total_length = total_length
         self.path = path
+        self.quota = quota if quota is not None else FetchQuota(None)
         # 稀疏文件，按 total_length 预占大小；实际磁盘块随写入增长
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
         os.ftruncate(self.fd, total_length)
@@ -53,102 +62,76 @@ class VersionCache:
         """保证 [start, end] 在本版本缓存中齐全，必要时回源补齐。
 
         去重规则（全程持有 plan_lock 做原子规划）：
-        - 缺口已被某个运行中的任务完全覆盖 -> 直接等待该任务；
-        - 与运行中的任务部分重叠 -> 重叠段等待原任务，剩余段另起任务，
-          因此重叠字节只会回源一次，互不重叠的缺口可同时回源；
-        - 没有任何运行中任务覆盖 -> 新建回源任务。
+        - 先把请求区间按“已覆盖 - 在途任务 - 本轮已规划段”精确扣减；
+        - 剩余缺口若已有在途任务 -> 等待该任务，不重复回源；
+        - 剩余缺口若已被本轮规划段覆盖 -> 合并进该段，不重复回源；
+        - 否则为新缺口建立任务，互不重叠的缺口各自并行回源。
+
+        额度规则：
+        - 只对“本次新建回源任务”的缺口计费；已缓存或已在补取团队里的字节
+          不再占额度；
+        - 所有新缺口在规划阶段一次性预留（reserve_many），预留不足时
+          整体失败并抛出 QuotaExceeded，此时**一个 GET 都还没发出**；
+        - 互不重叠的新缺口在预留成功后同时起任务，可并行回源。
         """
-        tasks: List["asyncio.Future[None]"] = []
         async with self.plan_lock:
             # 清理已完成但还没被 finally 移除的条目
             for done_gap in [g for g, f in self.in_flight.items() if f.done()]:
                 self.in_flight.pop(done_gap, None)
-            gaps = missing(self.covered, start, end)
-            for gap in gaps:
-                # 规划期间其他分片可能已完成并更新 covered：
-                # 每个缺口处理前都按最新 covered 重新裁剪，防止等待不再写入的分片
-                gap = self._trim_to_uncovered(gap)
-                if gap is None:
+
+            waits: List["asyncio.Future[None]"] = []
+
+            def wait_for(future: "asyncio.Future[None]") -> None:
+                if future not in waits:
+                    waits.append(future)
+
+            pending: List[Range] = missing(self.covered, start, end)
+            # 扣掉已有在途任务覆盖的字节：这部分已在补取，不重复回源、不占额度；
+            # 只有真正与本次缺口有重叠的在途任务才需要等待
+            for inflight_gap, future in list(self.in_flight.items()):
+                if not pending:
+                    break
+                if not any(
+                    candidate[0] <= inflight_gap[1] and candidate[1] >= inflight_gap[0]
+                    for candidate in pending
+                ):
                     continue
-                # 任务可能在本轮规划中刚完成：剔除后用最新 covered 重算
-                inflight = self._find_inflight(gap)
-                if inflight is not None and inflight[1].done():
-                    self.in_flight.pop(inflight[0], None)
-                    inflight = None
-                    gap = self._trim_to_uncovered(gap)
-                    if gap is None:
-                        continue
-                if inflight is None:
-                    future = asyncio.get_running_loop().create_future()
-                    self.in_flight[gap] = future
-                    tasks.append(future)
-                    asyncio.create_task(
-                        self._run_fetch(gap, fetcher, max_retries, future)
-                    )
-                    continue
+                wait_for(future)
+                pending = [
+                    rest
+                    for candidate in pending
+                    for rest in subtract_gap(candidate, inflight_gap)
+                ]
+            # 扣减后的 pending 段彼此不重叠；covered 在本轮规划期间不变
+            # （更新也在同一把锁内），因此它们就是本次要新建任务的新缺口
+            planned = pending
 
-                inflight_gap, reusable_future = inflight
-                if inflight_gap[0] <= gap[0] and inflight_gap[1] >= gap[1]:
-                    # 运行中任务完全覆盖本缺口
-                    if reusable_future not in tasks:
-                        tasks.append(reusable_future)
-                    continue
+            # 一次性预留所有新缺口的额度；不足则抛 QuotaExceeded，
+            # 此时尚未创建任务，也就没有发出任何新 GET
+            reservations: List[Reservation] = []
+            if planned:
+                reservations = await self.quota.reserve_many(
+                    [gap_end - gap_start + 1 for gap_start, gap_end in planned]
+                )
 
-                # 部分重叠：重叠部分等待原任务，剩余未覆盖部分新建任务
-                if reusable_future not in tasks:
-                    tasks.append(reusable_future)
-                for piece in subtract_gap(gap, inflight_gap):
-                    piece = self._trim_to_uncovered(piece)
-                    if piece is None:
-                        continue
-                    # piece 已是减去重叠后的精确缺口：只有完全包含它的在途任务
-                    # 才能满足，部分重叠不算（否则会漏掉夹缝中的缺口）
-                    cover = self._covering_inflight(piece)
-                    if cover is not None and not cover[1].done():
-                        if cover[1] not in tasks:
-                            tasks.append(cover[1])
-                        continue
-                    if cover is not None:
-                        self.in_flight.pop(cover[0], None)
-                        piece = self._trim_to_uncovered(piece)
-                        if piece is None:
-                            continue
-                    piece_future = asyncio.get_running_loop().create_future()
-                    self.in_flight[piece] = piece_future
-                    tasks.append(piece_future)
-                    asyncio.create_task(
-                        self._run_fetch(piece, fetcher, max_retries, piece_future)
-                    )
-        # 规划完成后再等待，避免持有锁期间串行化
-        for future in tasks:
-            await future
-
-    def _find_inflight(
-        self, gap: Range
-    ) -> Optional[Tuple[Range, "asyncio.Future[None]"]]:
-        """返回任意与 gap 有重叠的在途任务。"""
-        for inflight_gap, future in self.in_flight.items():
-            g_start, g_end = gap
-            i_start, i_end = inflight_gap
-            if i_start <= g_end and i_end >= g_start:
-                return inflight_gap, future
-        return None
-
-    def _covering_inflight(
-        self, gap: Range
-    ) -> Optional[Tuple[Range, "asyncio.Future[None]"]]:
-        """返回完全包含 gap 的在途任务（部分重叠不算）。"""
-        for inflight_gap, future in self.in_flight.items():
-            if inflight_gap[0] <= gap[0] and inflight_gap[1] >= gap[1]:
-                return inflight_gap, future
-        return None
-
-    def _trim_to_uncovered(self, gap: Range) -> Optional[Range]:
-        """按最新 covered 裁剪，返回缺口仍未覆盖的部分。"""
-        remain = missing(self.covered, gap[0], gap[1])
-        if not remain:
-            return None
-        return remain[0]
+            for (gap, reservation) in zip(planned, reservations):
+                future = asyncio.get_running_loop().create_future()
+                self.in_flight[gap] = future
+                waits.append(future)
+                asyncio.create_task(
+                    self._run_fetch(gap, fetcher, max_retries, future, reservation)
+                )
+        # 规划完成后再等待，避免持有锁期间串行化。
+        # 等齐本次登记的所有任务再抛第一个异常，避免遗漏某个 future 的异常。
+        first_exc: Optional[BaseException] = None
+        for future in waits:
+            try:
+                await future
+            except BaseException as exc:  # noqa: BLE001 - 汇总后统一抛出
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
 
     async def _run_fetch(
         self,
@@ -156,17 +139,25 @@ class VersionCache:
         fetcher: Fetcher,
         max_retries: int,
         future: "asyncio.Future[None]",
+        reservation: Reservation,
     ) -> None:
         start, end = gap
+        amount = end - start + 1
         try:
             data: Optional[bytes] = None
             last_exc: Optional[BaseException] = None
             for attempt in range(1, max_retries + 1):
+                if attempt > 1:
+                    # 重试是对源站的一次新读取，必须重新预留额度；
+                    # 预留不到时 QuotaExceeded 直接向上抛，由 HTTP 层回 429
+                    reservation = await self.quota.reserve(amount)
                 try:
-                    data = await fetcher(self.etag, start, end)
+                    data = await fetcher(self.etag, start, end, reservation)
                     break
                 except VersionChanged:
                     # 源站已换片，重试没有意义，直接向上抛出
+                    raise
+                except QuotaExceeded:
                     raise
                 except Exception as exc:  # noqa: BLE001 - 回源失败统一重试
                     last_exc = exc
@@ -185,9 +176,9 @@ class VersionCache:
                     f"回源补齐缺口 {start}-{end} 失败（已重试 {max_retries} 次）: "
                     f"{last_exc!r}"
                 )
-            if len(data) != end - start + 1:
+            if len(data) != amount:
                 raise UpstreamError(
-                    f"源站回包截断：期望 {end - start + 1} 字节，实收 {len(data)}"
+                    f"源站回包截断：期望 {amount} 字节，实收 {len(data)}"
                 )
             # pread/pwrite 按偏移原子定位，多任务并发写互不干扰
             view = memoryview(data)
@@ -228,9 +219,13 @@ class VersionCache:
 class CacheStore:
     """管理所有 ETag 版本的 VersionCache（简单 LRU，超容量淘汰最旧版本）。"""
 
-    def __init__(self, root: str, max_versions: int = 3) -> None:
+    def __init__(
+        self, root: str, max_versions: int = 3, quota: Optional[FetchQuota] = None
+    ) -> None:
         self.root = root
         self.max_versions = max_versions
+        # 额度账本按进程共享：所有 ETag 版本共用同一份回源额度
+        self.quota = quota if quota is not None else FetchQuota(None)
         os.makedirs(root, exist_ok=True)
         self._entries: "OrderedDict[str, VersionCache]" = OrderedDict()
         self._lock = asyncio.Lock()
@@ -247,6 +242,7 @@ class CacheStore:
                 etag=etag,
                 total_length=total_length,
                 path=os.path.join(version_dir, "data.bin"),
+                quota=self.quota,
             )
             self._entries[etag] = entry
             while len(self._entries) > self.max_versions:

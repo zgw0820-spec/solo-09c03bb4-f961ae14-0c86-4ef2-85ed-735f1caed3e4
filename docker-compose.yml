@@ -26,6 +26,8 @@ services:
       CACHE_MAX_VERSIONS: "3"
       FETCH_MAX_RETRIES: "3"
       HTTP_TIMEOUT: "10"
+      # 可选回源额度（字节）。留空=不限量；仅对本次进程运行内有效，重启清零。
+      ORIGIN_BUDGET_BYTES: ${ORIGIN_BUDGET_BYTES:-}
     volumes:
       - proxy-cache:/data/cache
     ports:

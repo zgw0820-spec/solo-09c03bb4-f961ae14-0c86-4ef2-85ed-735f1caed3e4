@@ -71,14 +71,52 @@ ETag: "<当前版本强ETag>"
 - `POST /admin/swap` 原子换片，`GET /stats` 看版本、ETag、区间请求数、峰值并发；
 - `POST /admin/fault` 注入故障：`truncate`（持续截断）、`truncate_once`（截断一次）、`swap_during`（回源途中换片）、`delay`（响应延迟）、`none`（清除）。
 
+### 7. 可选的回源额度（本次运行内有效）
+
+备份线路的流量包是固定字节数，因此给代理加了**可选**的回源额度，
+配置项为 `ORIGIN_BUDGET_BYTES`（字节）：
+
+- **只在单个实例的本次进程运行内生效**：内存账本（`proxy/app/quota.py`），不落盘、不跨重启、不跨副本；未设置或留空表示不限量，此时仍统计已用/预留但可用为 `null`；
+- **已用只计代理从本地源站读到的 206 正文字节**：流式累计响应正文，截断时读到多少就扣多少；非 206 响应和连接建立前的失败不计正文；
+- **两阶段记账**：回源前按缺口长度预留（reserve），每次回源尝试结束结算（settle）——实际读到的字节计入已用，未用部分归还；
+- **已缓存或正在补取的字节不再占额度**：规划时先扣掉 `covered` 与 `in_flight` 覆盖的部分，只对真正要新建回源任务的缺口计费；
+- **取段时按长度一并预留所有新缺口**：`ensure()` 在同一次规划里算出全部新缺口，用 `reserve_many` 一次性预留；额度不够时 **`/video` 直接回 `429`，且一个回源 GET 都还没发出**；
+- **额度够时互不重叠的缺口仍可并行**：预留成功后再同时起多个回源任务；预留只在规划临界区内做，不会把回源串行化；
+- **重试须再预留**：每次重试都是一次新的源站读取，预留不到同样回 `429`；截断失败的尝试已读字节照扣、剩余预留归还（见下文实测）；
+- **强 ETag 校验保持不变**：换片仍返回 `409`，且换片失败不扣未读字节。
+
+`GET /stats` 增加 `origin_budget`：
+
+```json
+{
+  "origin_budget": {
+    "enabled": true,
+    "capacity_bytes": 60000,
+    "used_bytes": 19804,
+    "reserved_bytes": 0,
+    "available_bytes": 40196
+  }
+}
+```
+
+另在顶层增加 `quota_rejected`（429 次数）与 `quota_shortfall_bytes`（累计缺口字节）便于值班排查。
+
+
 ## 二、启动（Docker Compose）
 
 ```bash
+# 不限额度（默认）
 docker compose up --build
+
+# 本次运行给代理 1 MiB（1048576 字节）回源额度
+ORIGIN_BUDGET_BYTES=1048576 docker compose up --build
 ```
 
 - 代理：http://localhost:18000
 - 源站：http://localhost:18080
+
+`ORIGIN_BUDGET_BYTES` 通过 compose 的 `${ORIGIN_BUDGET_BYTES:-}` 透传；不设置即不限量。
+额度是**进程内**状态，`docker compose restart proxy` 或重新 `up` 都会清零。
 
 停止并清理数据卷：
 
@@ -150,15 +188,46 @@ curl -s http://localhost:18080/stats
 curl -s http://localhost:18000/healthz
 ```
 
+### 8. 回源额度：查询、耗尽、重启清零
+
+```bash
+# 用 4000 字节额度启动
+ORIGIN_BUDGET_BYTES=4000 docker compose up -d --build
+
+# 取 3000 字节：成功，已用 3000、可用 1000
+curl -s -H 'Range: bytes=0-2999' http://localhost:18000/video -o /dev/null
+curl -s http://localhost:18000/stats | python3 -m json.tool
+
+# 再取一段新的 2000 字节：额度不足 -> 429，且源站不会收到新的 GET 取字节
+curl -i -H 'Range: bytes=10000-11999' http://localhost:18000/video
+curl -s http://localhost:18080/stats | python3 -m json.tool   # range_requests 未增长
+
+# 已缓存的 0-2999 仍可命中，不受额度影响
+curl -i -H 'Range: bytes=0-999' http://localhost:18000/video
+
+# 重启代理：额度清零（缓存卷仍在，但已用额度不跨运行保留）
+docker compose restart proxy
+curl -s http://localhost:18000/stats | python3 -m json.tool
+```
+
+429 回包形状：
+
+```json
+{"error": "origin_budget_exhausted",
+ "message": "回源额度不足：本次需要 2000 字节，当前可用 1000 字节"}
+```
+
 ## 四、本地自测（无需 Docker）
 
-仓库内置虚拟环境依赖安装与两套测试（本机已验证）：
+仓库内置虚拟环境依赖安装与四套测试（本机已验证）：
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install fastapi uvicorn httpx
-.venv/bin/python -I tests/selftest.py   # 28 项功能自测
-.venv/bin/python -I tests/stress.py     # 40 随机区间并发压测
+.venv/bin/python -I tests/selftest.py      # 28 项功能自测
+.venv/bin/python -I tests/stress.py        # 40 随机区间并发压测
+.venv/bin/python -I tests/quota_test.py    # 24 项额度专项（含争用/截断/换片）
+.venv/bin/python -I tests/quota_stress.py  # 60 随机区间并发争用额度
 ```
 
 ## 五、实测结果（本机）
@@ -179,6 +248,22 @@ python3 -m venv .venv
 - 源站峰值并发区间 **41**（非重叠缺口同时回源）；
 - 另做 30 个随机种子的缓存层验证：回源分片互不重叠、请求并集无空洞无多余、二轮全命中，全部通过。
 
+### 额度专项 `tests/quota_test.py`：24/24 通过
+
+- G 额度内并行：三个互不重叠缺口在 10 KB 额度下同时回源（峰值并发 3，耗时 0.45s ≈ 单次源站延迟）；已用恰为并集 4000 字节，预留归零，可用 6000；
+- I 去重与额度：全命中请求不新增已用；两个请求同时抢同一 10 KB 缺口只回源 1 次、只扣一次 10000 字节；
+- H 并发争用：3 个 4000 字节互不重叠请求同时到达、总额度 10000 —— 结果 `[206, 206, 429]`，429 回包写明“需要 4000、可用 2000”，源站只收到 2 次 GET，已用恰为 8000，总耗时 0.43s（未串行化）；额度耗尽后新缺口一律 429，而已缓存字节仍 206；
+- J 截断与重试：一次性截断时首次读到 935 字节 + 重试读满 1000 字节，共扣 1935；持续截断 + 1500 字节额度时，首尝试扣 935，重试再预留 1000 但只剩 565 → **429**，源站只收到 1 次 GET，预留归零；
+- K 强 ETag：回源途中换片仍 409，失败尝试不扣未读字节、预留归还；恢复后 206 且 ETag 为强 ETag；
+- 重启代理后 `used_bytes` 归零、容量仍为配置值（额度只在单次运行内生效）。
+
+### 额度争用压测 `tests/quota_stress.py`：通过（连续 3 次结果一致）
+
+- 60 KB 额度、60 个随机区间并发（源站 0.3s 延迟）：**19 个 206 + 41 个 429**，无其他状态码；
+- 19 个成功响应逐字节比对源站：**0 段不一致**；
+- 已用 59804 ≤ 60000，预留 **0**（无泄漏），可用 = 容量 − 已用 = 196；
+- 额度耗尽后请求新缺口 → 429。
+
 ## 六、待办 / 已知限制
 
 1. **缓存元数据不跨进程持久化**：`covered` 区间列表只在内存，代理重启后磁盘稀疏文件仍在但会被视为未覆盖而重新回源（当前 LRU 淘汰会主动删盘，重启场景等同于冷启动）。需要重启复用的话，可把 `covered` 随版本落盘。
@@ -187,3 +272,6 @@ python3 -m venv .venv
 4. **无鉴权与限流**：源站管理接口 `/admin/*` 仅适合本地/内网联调，生产暴露需加认证。
 5. **HTTP 客户端连接池与超时**为固定配置，大并发下可进一步调优 `httpx.Limits`。
 6. 稀疏文件按 `Content-Length` 预 `ftruncate` 到完整大小，`du` 看实际块占用、`ls` 看逻辑大小，属预期行为。
+7. **额度是单进程内存态**：不跨重启、不跨副本、不持久化；多副本部署时每个副本各自持有一份额度，需要全局额度得引入外部账本（与第 3 条同类）。
+8. **额度与缓存共用一份账本**：额度按“新缺口字节”计，已缓存/在途字节不计；LRU 淘汰版本后同一 ETag 再从磁盘/源站重取时，会作为新缺口重新占额度（淘汰同时会删盘，属冷启动语义）。
+9. 429 的 `Retry-After` 固定为 1 秒，未做按剩余额度或时间窗的退避。
